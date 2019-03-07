@@ -4636,11 +4636,20 @@ Handlers.prototype.register = function(key, handler) {
 
 Handlers.prototype._fns = {
 
+  //  (wje) - patched 2019-03-07 to add creation capability.
   'member-child-identifier': function(component, partial) {
     var key = component.expression.value;
     var value = partial.value;
     if (value instanceof Object && key in value) {
       return [ { value: value[key], path: partial.path.concat(key) } ]
+    } else if (this.applyMode && this.buildFn) {
+      var altered = this.buildFn(partial, value, key);
+      if (altered) {
+        value = partial.value;
+        if (value instanceof Object && key in value) {
+          return [ { value: value[key], path: partial.path.concat(key) } ]
+        }
+      }
     }
   },
 
@@ -4668,11 +4677,28 @@ Handlers.prototype._fns = {
   'subscript-child-wildcard':
     _descend(function() { return true }),
 
+  //  (wje) - patched 2019-03-07 to add creation capability.
   'subscript-child-slice': function(component, partial) {
     if (is_array(partial.value)) {
-      var args = component.expression.value.split(':').map(_parse_nullable_int);
+      var indexes = component.expression.value.split(':');
+      var args = indexes.map(_parse_nullable_int);
       var values = partial.value.map(function(v, i) { return { value: v, path: partial.path.concat(i) } });
-      return slice.apply(null, [values].concat(args));
+      var results = slice.apply(null, [values].concat(args));
+
+      //  if we're in 'apply mode', that means that were called as part of an
+      //  'apply' operation.
+      if (this.applyMode) {
+        var start = parseInt(indexes[0]);
+        results.forEach(function(element, index) {
+          if (element === undefined) {
+            results[index] = {
+              value: 'stub',
+              path: partial.path.concat(start + index)
+            }
+          }
+        });
+      }
+      return results;
     }
   },
 
@@ -4785,24 +4811,49 @@ function is_object(val) {
   return val && !(val instanceof Array) && val instanceof Object;
 }
 
+//  (wje) - patched 2019-03-07 to add creation capability.
 function traverser(recurse) {
 
   return function(partial, ref, passable, count) {
 
     var value = partial.value;
     var path = partial.path;
+    var comp = partial.component;
+    var nextComp = partial.nextComponent;
 
     var results = [];
 
     var descend = function(value, path) {
 
       if (is_array(value)) {
+
         value.forEach(function(element, index) {
           if (results.length >= count) { return }
           if (passable(index, element, ref)) {
             results.push({ path: path.concat(index), value: element });
           }
         });
+
+        if (this.applyMode && this.buildFn) {
+          if (results.length === 0) {
+            var altered = this.buildFn(partial, value, ref);
+          } else if (nextComp &&
+                        nextComp.operation === 'subscript' &&
+                        !is_array(results[0].value) &&
+                        !is_object(results[0].value)) {
+            var altered = this.buildFn(partial, value, ref);
+          }
+          if (altered) {
+            value = partial.value;
+            value.forEach(function(element, index) {
+              if (results.length >= count) { return }
+              if (passable(index, element, ref)) {
+                results.push({ path: path.concat(index), value: element });
+              }
+            });
+          }
+        }
+
         value.forEach(function(element, index) {
           if (results.length >= count) { return }
           if (recurse) {
@@ -4810,12 +4861,27 @@ function traverser(recurse) {
           }
         });
       } else if (is_object(value)) {
+
         this.keys(value).forEach(function(k) {
           if (results.length >= count) { return }
           if (passable(k, value[k], ref)) {
             results.push({ path: path.concat(k), value: value[k] });
           }
-        })
+        });
+
+        if (results.length === 0 && this.applyMode && this.buildFn) {
+          var altered = this.buildFn(partial, this.keys(value), ref);
+          if (altered) {
+            value = partial.value;
+            this.keys(value).forEach(function(k) {
+              if (results.length >= count) { return }
+              if (passable(k, value[k], ref)) {
+                results.push({ path: path.concat(k), value: value[k] });
+              }
+            });
+          }
+        }
+
         this.keys(value).forEach(function(k) {
           if (results.length >= count) { return }
           if (recurse) {
@@ -4891,16 +4957,23 @@ JSONPath.prototype.parent = function(obj, string) {
   return this.value(obj, node.path);
 }
 
-JSONPath.prototype.apply = function(obj, string, fn) {
+//  (wje) - patched 2019-03-07 to add creation capability.
+JSONPath.prototype.apply = function(obj, string, fn, buildFn) {
 
   assert.ok(obj instanceof Object, "obj needs to be an object");
   assert.ok(string, "we need a path");
   assert.equal(typeof fn, "function", "fn needs to be function")
 
+  this.handlers.applyMode = true;
+  this.handlers.buildFn = buildFn;
+
   var nodes = this.nodes(obj, string).sort(function(a, b) {
     // sort nodes so we apply from the bottom up
     return b.path.length - a.path.length;
   });
+
+  this.handlers.buildFn = null;
+  this.handlers.applyMode = false;
 
   nodes.forEach(function(node) {
     var key = node.path.pop();
@@ -4999,6 +5072,11 @@ JSONPath.prototype.nodes = function(obj, string, count) {
     partials.forEach(function(p) {
 
       if (matches.length >= count) return;
+
+      //  (wje) - patched 2019-03-07 to add creation capability.
+      p.component = component;
+      p.nextComponent = path[index + 1];
+
       var results = handler(component, p, count);
 
       if (index == path.length - 1) {
